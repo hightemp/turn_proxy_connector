@@ -1,0 +1,26 @@
+[Unit]
+Description=TURN Proxy Relay Server
+Documentation=https://github.com/hightemp/turn_proxy_server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/turn-proxy-server --listen 0.0.0.0:56000 --http-listen 0.0.0.0:8080 --timeout 30m
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=turn-proxy
+
+[Install]
+WantedBy=multi-user.target
