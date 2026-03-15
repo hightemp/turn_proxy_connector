@@ -5,6 +5,7 @@ data class AppSettings(
     val serverHost: String = "",
     val serverPort: Int = 56000,
     val connectionCount: Int = 1,
+    val turnPoolSize: Int = 4,
     val connectionTimeoutSec: Int = 30,
     val idleTimeoutMin: Int = 30,
     val useDtls: Boolean = true,

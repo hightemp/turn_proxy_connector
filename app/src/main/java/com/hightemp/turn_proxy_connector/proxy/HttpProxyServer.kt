@@ -1,6 +1,12 @@
 package com.hightemp.turn_proxy_connector.proxy
 
 import com.hightemp.turn_proxy_connector.data.AppSettings
+import com.hightemp.turn_proxy_connector.data.TurnServer
+import com.hightemp.turn_proxy_connector.turn.PlainTcpTunnel
+import com.hightemp.turn_proxy_connector.turn.TunnelConnection
+import com.hightemp.turn_proxy_connector.turn.TunnelConnectionFactory
+import com.hightemp.turn_proxy_connector.turn.TunnelPool
+import com.hightemp.turn_proxy_connector.turn.TurnServerConfig
 import com.hightemp.turn_proxy_connector.util.LogBuffer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,13 +25,19 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Local HTTP proxy server on 127.0.0.1:proxyPort.
  * Forwards every incoming HTTP request (including CONNECT for HTTPS)
- * to a remote Go relay server over plain TCP.
+ * to a remote Go relay server through a TunnelConnection pool.
  *
- * Flow:  Browser -> this proxy -> TCP -> relay server -> Internet
+ * Flow:  Browser -> this proxy -> TunnelPool -> relay server -> Internet
+ *
+ * TunnelConnection can be:
+ * - PlainTcpTunnel (direct TCP to VPS, for debugging)
+ * - TurnTunnel (via TURN relay server)
+ * - DTLS+TURN (future, for encryption)
  */
 class HttpProxyServer(
     private val settings: AppSettings,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val turnServers: List<TurnServer> = emptyList()
 ) {
     companion object {
         private const val TAG = "HttpProxy"
@@ -35,16 +47,31 @@ class HttpProxyServer(
     private var serverSocket: ServerSocket? = null
     private val isRunning = AtomicBoolean(false)
     private val _activeConnections = AtomicLong(0)
+    private val _bytesSent = AtomicLong(0)
+    private val _bytesReceived = AtomicLong(0)
     private var serverJob: Job? = null
+    private var tunnelPool: TunnelPool? = null
 
     val running: Boolean get() = isRunning.get()
     val activeConnections: Long get() = _activeConnections.get()
+    val bytesSent: Long get() = _bytesSent.get()
+    val bytesReceived: Long get() = _bytesReceived.get()
 
     fun start() {
         if (isRunning.getAndSet(true)) {
             LogBuffer.w(TAG, "Proxy already running")
             return
         }
+
+        // Create the tunnel pool
+        val poolSize = settings.turnPoolSize.coerceIn(1, 32)
+        tunnelPool = TunnelPool(
+            factory = object : TunnelPool.TunnelFactory {
+                override fun create(): TunnelConnection = createTunnel()
+            },
+            poolSize = poolSize,
+            maxRetries = 3
+        )
 
         serverJob = scope.launch(Dispatchers.IO) {
             try {
@@ -53,7 +80,13 @@ class HttpProxyServer(
                     bind(InetSocketAddress("127.0.0.1", settings.proxyPort))
                 }
                 LogBuffer.i(TAG, "Listening on 127.0.0.1:${settings.proxyPort}")
-                LogBuffer.i(TAG, "Relay server: ${settings.serverHost}:${settings.serverPort}")
+
+                val enabledTurnServers = turnServers.filter { it.enabled }
+                if (enabledTurnServers.isNotEmpty()) {
+                    LogBuffer.i(TAG, "Using TURN servers: ${enabledTurnServers.joinToString { "${it.host}:${it.port}" }} (pool=$poolSize)")
+                } else {
+                    LogBuffer.i(TAG, "No TURN servers, using direct TCP to ${settings.serverHost}:${settings.serverPort} (pool=$poolSize)")
+                }
 
                 while (isActive && isRunning.get()) {
                     try {
@@ -79,11 +112,33 @@ class HttpProxyServer(
 
     fun stop() {
         isRunning.set(false)
+        tunnelPool?.shutdown()
+        tunnelPool = null
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
         serverJob?.cancel()
         serverJob = null
         LogBuffer.i(TAG, "Proxy stop requested")
+    }
+
+    private fun createTunnel(): TunnelConnection {
+        val enabledTurnServers = turnServers.filter { it.enabled }
+        val turnConfigs = enabledTurnServers.map { server ->
+            TurnServerConfig(
+                host = server.host,
+                port = server.port,
+                username = server.username,
+                password = server.password,
+                useTcp = server.useTcp
+            )
+        }
+        val vpsAddress = InetSocketAddress(settings.serverHost, settings.serverPort)
+        return TunnelConnectionFactory(
+            turnServers = turnConfigs,
+            vpsAddress = vpsAddress,
+            useDtls = settings.useDtls,
+            connectionTimeout = settings.connectionTimeoutSec * 1000
+        ).create()
     }
 
     private fun handleClient(clientSocket: Socket) {
@@ -117,23 +172,34 @@ class HttpProxyServer(
 
             LogBuffer.d(TAG, requestLine)
 
-            // Connect to relay server
-            val relaySocket = Socket()
-            try {
-                relaySocket.connect(
-                    InetSocketAddress(settings.serverHost, settings.serverPort),
-                    settings.connectionTimeoutSec * 1000
-                )
-                relaySocket.soTimeout = settings.idleTimeoutMin * 60 * 1000
-            } catch (e: Exception) {
-                LogBuffer.e(TAG, "Cannot connect to relay: ${e.message}")
+            // Acquire connection from the pool (with retry/failover)
+            val pool = tunnelPool
+            val relayStream = if (pool != null) {
+                try {
+                    pool.acquire(timeoutMs = settings.connectionTimeoutSec * 1000L)
+                } catch (e: Exception) {
+                    LogBuffer.e(TAG, "Cannot acquire tunnel: ${e.message}")
+                    null
+                }
+            } else {
+                // Fallback: create direct tunnel if pool somehow null
+                try {
+                    createTunnel().connect()
+                } catch (e: Exception) {
+                    LogBuffer.e(TAG, "Cannot connect to relay: ${e.message}")
+                    null
+                }
+            }
+
+            if (relayStream == null) {
+                LogBuffer.e(TAG, "Tunnel connection failed")
                 sendError(clientOut, "502 Bad Gateway", "Cannot connect to relay server")
                 clientSocket.close()
                 return
             }
 
-            val relayIn = relaySocket.getInputStream()
-            val relayOut = relaySocket.getOutputStream()
+            val relayIn = relayStream.inputStream
+            val relayOut = relayStream.outputStream
 
             // Send request + headers to relay
             val req = buildString {
@@ -171,11 +237,9 @@ class HttpProxyServer(
                 // Bidirectional relay
                 val t1 = Thread {
                     pipeStream(clientIn, relayOut, "client->relay")
-                    try { relaySocket.shutdownOutput() } catch (_: Exception) {}
                 }
                 val t2 = Thread {
                     pipeStream(relayIn, clientOut, "relay->client")
-                    try { clientSocket.shutdownOutput() } catch (_: Exception) {}
                 }
                 t1.start()
                 t2.start()
@@ -195,7 +259,7 @@ class HttpProxyServer(
                 pipeStream(relayIn, clientOut, "relay->client")
             }
 
-            try { relaySocket.close() } catch (_: Exception) {}
+            relayStream.close()
             try { clientSocket.close() } catch (_: Exception) {}
         } catch (e: Exception) {
             LogBuffer.e(TAG, "Connection error: ${e.message}")
@@ -226,11 +290,14 @@ class HttpProxyServer(
     private fun pipeStream(input: InputStream, output: OutputStream, label: String) {
         try {
             val buffer = ByteArray(BUFFER_SIZE)
+            val isSending = label.contains("client->relay")
             while (true) {
                 val n = input.read(buffer)
                 if (n == -1) break
                 output.write(buffer, 0, n)
                 output.flush()
+                if (isSending) _bytesSent.addAndGet(n.toLong())
+                else _bytesReceived.addAndGet(n.toLong())
             }
         } catch (_: Exception) {
             // Connection closed
@@ -246,6 +313,7 @@ class HttpProxyServer(
             if (n == -1) break
             output.write(buffer, 0, n)
             remaining -= n
+            _bytesSent.addAndGet(n.toLong())
         }
         output.flush()
     }

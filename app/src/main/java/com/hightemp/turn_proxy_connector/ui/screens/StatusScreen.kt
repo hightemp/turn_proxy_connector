@@ -23,6 +23,8 @@ fun StatusScreen(viewModel: MainViewModel) {
     val proxyState by viewModel.proxyState.collectAsState()
     val settings by viewModel.settings.collectAsState()
     val activeConns by viewModel.activeConnections.collectAsState()
+    val bytesSent by viewModel.bytesSent.collectAsState()
+    val bytesReceived by viewModel.bytesReceived.collectAsState()
 
     val statusColor by animateColorAsState(
         targetValue = when (proxyState) {
@@ -105,6 +107,27 @@ fun StatusScreen(viewModel: MainViewModel) {
                 InfoRow("Relay Server", "${settings.serverHost.ifBlank { "Not set" }}:${settings.serverPort}")
                 InfoRow("Active Connections", "$activeConns")
                 InfoRow("DTLS", if (settings.useDtls) "Enabled" else "Disabled")
+                InfoRow("Pool Size", "${settings.turnPoolSize}")
+            }
+        }
+
+        // Traffic stats card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    "Traffic",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                InfoRow("Sent", formatBytes(bytesSent))
+                InfoRow("Received", formatBytes(bytesReceived))
+                InfoRow("Total", formatBytes(bytesSent + bytesReceived))
             }
         }
 
@@ -137,4 +160,14 @@ private fun InfoRow(label: String, value: String) {
         Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
     }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024) return "%.1f KB".format(kb)
+    val mb = kb / 1024.0
+    if (mb < 1024) return "%.1f MB".format(mb)
+    val gb = mb / 1024.0
+    return "%.2f GB".format(gb)
 }

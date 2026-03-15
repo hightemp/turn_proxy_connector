@@ -5,6 +5,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
@@ -21,6 +22,8 @@ fun ServersScreen(viewModel: MainViewModel) {
     val servers by viewModel.servers.collectAsState()
     var showDialog by remember { mutableStateOf(false) }
     var editingServer by remember { mutableStateOf<TurnServer?>(null) }
+    var showFetchDialog by remember { mutableStateOf(false) }
+    val fetchState by viewModel.fetchState.collectAsState()
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Add button
@@ -36,15 +39,24 @@ fun ServersScreen(viewModel: MainViewModel) {
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold
             )
-            FilledTonalButton(
-                onClick = {
-                    editingServer = null
-                    showDialog = true
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilledTonalButton(
+                    onClick = { showFetchDialog = true }
+                ) {
+                    Icon(Icons.Default.CloudDownload, "Fetch credentials")
+                    Spacer(Modifier.width(4.dp))
+                    Text("Fetch")
                 }
-            ) {
-                Icon(Icons.Default.Add, "Add server")
-                Spacer(Modifier.width(4.dp))
-                Text("Add")
+                FilledTonalButton(
+                    onClick = {
+                        editingServer = null
+                        showDialog = true
+                    }
+                ) {
+                    Icon(Icons.Default.Add, "Add server")
+                    Spacer(Modifier.width(4.dp))
+                    Text("Add")
+                }
             }
         }
 
@@ -95,6 +107,17 @@ fun ServersScreen(viewModel: MainViewModel) {
                     viewModel.addServer(server)
                 }
                 showDialog = false
+            }
+        )
+    }
+
+    if (showFetchDialog) {
+        FetchCredentialsDialog(
+            fetchState = fetchState,
+            onFetch = { link -> viewModel.fetchCredentials(link) },
+            onDismiss = {
+                showFetchDialog = false
+                viewModel.resetFetchState()
             }
         )
     }
@@ -265,6 +288,77 @@ private fun ServerDialog(
                 enabled = host.isNotBlank()
             ) {
                 Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+private fun FetchCredentialsDialog(
+    fetchState: MainViewModel.FetchState,
+    onFetch: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var link by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Fetch TURN Credentials") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Paste a VK Call or Yandex Telemost link to auto-fetch TURN server credentials.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = link,
+                    onValueChange = { link = it },
+                    label = { Text("VK / Yandex Link") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = fetchState != MainViewModel.FetchState.LOADING,
+                    placeholder = { Text("https://vk.com/call/join/...") }
+                )
+                when (fetchState) {
+                    MainViewModel.FetchState.LOADING -> {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            Text("Fetching credentials...", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    MainViewModel.FetchState.SUCCESS -> {
+                        Text(
+                            "Server added successfully!",
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    MainViewModel.FetchState.ERROR -> {
+                        Text(
+                            "Failed to fetch credentials. Check the link and try again.",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    MainViewModel.FetchState.IDLE -> {}
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onFetch(link) },
+                enabled = link.isNotBlank() && fetchState != MainViewModel.FetchState.LOADING
+            ) {
+                Text("Fetch")
             }
         },
         dismissButton = {

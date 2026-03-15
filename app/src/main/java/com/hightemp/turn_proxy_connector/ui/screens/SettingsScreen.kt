@@ -68,6 +68,12 @@ fun SettingsScreen(viewModel: MainViewModel) {
             )
             Spacer(modifier = Modifier.height(8.dp))
             NumberField(
+                label = "TURN Pool Size",
+                value = settings.turnPoolSize,
+                onValueChange = { viewModel.updateSettings(settings.copy(turnPoolSize = it.coerceIn(1, 32))) }
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            NumberField(
                 label = "Connection Timeout (sec)",
                 value = settings.connectionTimeoutSec,
                 onValueChange = { viewModel.updateSettings(settings.copy(connectionTimeoutSec = it.coerceIn(5, 300))) }

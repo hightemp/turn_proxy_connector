@@ -50,6 +50,12 @@ class ProxyService : Service() {
     val activeConnections: Long
         get() = proxyServer?.activeConnections ?: 0
 
+    val bytesSent: Long
+        get() = proxyServer?.bytesSent ?: 0
+
+    val bytesReceived: Long
+        get() = proxyServer?.bytesReceived ?: 0
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,6 +82,7 @@ class ProxyService : Service() {
 
         val repo = SettingsRepository(applicationContext)
         val settings = repo.loadSettings()
+        val servers = repo.loadServers()
 
         if (settings.serverHost.isBlank()) {
             LogBuffer.e(TAG, "Server host is not configured!")
@@ -85,7 +92,7 @@ class ProxyService : Service() {
 
         startForeground(NOTIFICATION_ID, createNotification("Proxy starting..."))
 
-        proxyServer = HttpProxyServer(settings, serviceScope).also {
+        proxyServer = HttpProxyServer(settings, serviceScope, servers).also {
             it.start()
         }
 
