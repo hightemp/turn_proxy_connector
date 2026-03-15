@@ -73,6 +73,17 @@ class HttpProxyServer(
             maxRetries = 3
         )
 
+        // Pre-warm the pool in background to reduce first-request latency
+        scope.launch(Dispatchers.IO) {
+            try {
+                LogBuffer.i(TAG, "Warming up tunnel pool...")
+                tunnelPool?.warmUp(1)
+                LogBuffer.i(TAG, "Tunnel pool warm-up complete")
+            } catch (e: Exception) {
+                LogBuffer.w(TAG, "Pool warm-up failed: ${e.message}")
+            }
+        }
+
         serverJob = scope.launch(Dispatchers.IO) {
             try {
                 serverSocket = ServerSocket().apply {
@@ -143,6 +154,8 @@ class HttpProxyServer(
 
     private fun handleClient(clientSocket: Socket) {
         _activeConnections.incrementAndGet()
+        var pooledStream: TunnelPool.PooledStream? = null
+        var fallbackStream: TunnelConnection.StreamPair? = null
         try {
             clientSocket.soTimeout = settings.idleTimeoutMin * 60 * 1000
             val clientIn = clientSocket.getInputStream()
@@ -174,16 +187,18 @@ class HttpProxyServer(
 
             // Acquire connection from the pool (with retry/failover)
             val pool = tunnelPool
-            val relayStream = if (pool != null) {
-                try {
+            if (pool != null) {
+                pooledStream = try {
                     pool.acquire(timeoutMs = settings.connectionTimeoutSec * 1000L)
                 } catch (e: Exception) {
                     LogBuffer.e(TAG, "Cannot acquire tunnel: ${e.message}")
                     null
                 }
-            } else {
-                // Fallback: create direct tunnel if pool somehow null
-                try {
+            }
+
+            // Fallback: create direct tunnel if pool not available
+            if (pooledStream == null && pool == null) {
+                fallbackStream = try {
                     createTunnel().connect()
                 } catch (e: Exception) {
                     LogBuffer.e(TAG, "Cannot connect to relay: ${e.message}")
@@ -191,15 +206,15 @@ class HttpProxyServer(
                 }
             }
 
-            if (relayStream == null) {
+            if (pooledStream == null && fallbackStream == null) {
                 LogBuffer.e(TAG, "Tunnel connection failed")
                 sendError(clientOut, "502 Bad Gateway", "Cannot connect to relay server")
                 clientSocket.close()
                 return
             }
 
-            val relayIn = relayStream.inputStream
-            val relayOut = relayStream.outputStream
+            val relayIn = pooledStream?.inputStream ?: fallbackStream!!.inputStream
+            val relayOut = pooledStream?.outputStream ?: fallbackStream!!.outputStream
 
             // Send request + headers to relay
             val req = buildString {
@@ -234,13 +249,26 @@ class HttpProxyServer(
 
                 LogBuffer.d(TAG, "CONNECT tunnel: $statusLine")
 
-                // Bidirectional relay
-                val t1 = Thread {
-                    pipeStream(clientIn, relayOut, "client->relay")
-                }
-                val t2 = Thread {
-                    pipeStream(relayIn, clientOut, "relay->client")
-                }
+                // Bidirectional relay with proper cleanup:
+                // When one direction closes, close both sockets to unblock the other.
+                val t1 = Thread({
+                    try {
+                        pipeStream(clientIn, relayOut, "client->relay")
+                    } finally {
+                        // Client closed → close relay to unblock t2
+                        try { pooledStream?.close() ?: fallbackStream?.close() } catch (_: Exception) {}
+                        try { clientSocket.close() } catch (_: Exception) {}
+                    }
+                }, "proxy-pipe-c2r")
+                val t2 = Thread({
+                    try {
+                        pipeStream(relayIn, clientOut, "relay->client")
+                    } finally {
+                        // Relay closed → close client to unblock t1
+                        try { clientSocket.close() } catch (_: Exception) {}
+                        try { pooledStream?.close() ?: fallbackStream?.close() } catch (_: Exception) {}
+                    }
+                }, "proxy-pipe-r2c")
                 t1.start()
                 t2.start()
                 t1.join()
@@ -251,18 +279,85 @@ class HttpProxyServer(
                     .find { it.startsWith("Content-Length:", ignoreCase = true) }
                     ?.substringAfter(":")?.trim()?.toIntOrNull() ?: 0
 
-                if (contentLength > 0) {
-                    pipeBytes(clientIn, relayOut, contentLength)
+                val isChunkedRequest = headers.any {
+                    it.startsWith("Transfer-Encoding:", ignoreCase = true) &&
+                    it.contains("chunked", ignoreCase = true)
                 }
 
-                // Read full relay response and pipe to client
-                pipeStream(relayIn, clientOut, "relay->client")
+                if (isChunkedRequest) {
+                    pipeChunked(clientIn, relayOut, "client->relay")
+                } else if (contentLength > 0) {
+                    pipeBytes(clientIn, relayOut, contentLength.toLong())
+                }
+
+                // Read HTTP response: parse status line + headers to determine body length
+                val statusLine = readLine(relayIn) ?: ""
+                val respHeaders = mutableListOf<String>()
+                while (true) {
+                    val h = readLine(relayIn) ?: break
+                    if (h.isEmpty()) break
+                    respHeaders.add(h)
+                }
+
+                // Forward response status + headers to client
+                val resp = buildString {
+                    append(statusLine).append("\r\n")
+                    respHeaders.forEach { append(it).append("\r\n") }
+                    append("\r\n")
+                }
+                clientOut.write(resp.toByteArray(Charsets.ISO_8859_1))
+                clientOut.flush()
+
+                // Determine body transfer method
+                val respContentLength = respHeaders
+                    .find { it.startsWith("Content-Length:", ignoreCase = true) }
+                    ?.substringAfter(":")?.trim()?.toLongOrNull()
+
+                val isChunkedResponse = respHeaders.any {
+                    it.startsWith("Transfer-Encoding:", ignoreCase = true) &&
+                    it.contains("chunked", ignoreCase = true)
+                }
+
+                // Extract status code (e.g., "HTTP/1.1 204 No Content" → 204)
+                val statusCode = statusLine.split(" ").getOrNull(1)?.toIntOrNull() ?: 200
+                val hasNoBody = statusCode in 100..199 || statusCode == 204 || statusCode == 304
+
+                if (hasNoBody) {
+                    // No body expected
+                } else if (isChunkedResponse) {
+                    pipeChunked(relayIn, clientOut, "relay->client")
+                } else if (respContentLength != null && respContentLength >= 0) {
+                    pipeBytes(relayIn, clientOut, respContentLength)
+                } else {
+                    // No Content-Length, not chunked — read until EOF (e.g., HTTP/1.0)
+                    // Force connection close after this — can't determine when body ends otherwise
+                    pipeStream(relayIn, clientOut, "relay->client")
+                    // Connection is not reusable after read-until-EOF
+                    pooledStream?.close() ?: fallbackStream?.close()
+                    try { clientSocket.close() } catch (_: Exception) {}
+                    return
+                }
+
+                // Check if server requested closing the connection
+                val connectionClose = respHeaders.any {
+                    it.startsWith("Connection:", ignoreCase = true) &&
+                    it.contains("close", ignoreCase = true)
+                }
+
+                if (connectionClose) {
+                    // Server wants to close — destroy, don't reuse
+                    pooledStream?.close() ?: fallbackStream?.close()
+                } else {
+                    // Plain HTTP: release tunnel back to pool for reuse
+                    pooledStream?.release() ?: fallbackStream?.close()
+                }
             }
 
-            relayStream.close()
             try { clientSocket.close() } catch (_: Exception) {}
         } catch (e: Exception) {
             LogBuffer.e(TAG, "Connection error: ${e.message}")
+            // On error, destroy the connection (not reusable)
+            try { pooledStream?.close() ?: fallbackStream?.close() } catch (_: Exception) {}
         } finally {
             _activeConnections.decrementAndGet()
             try { clientSocket.close() } catch (_: Exception) {}
@@ -304,11 +399,11 @@ class HttpProxyServer(
         }
     }
 
-    private fun pipeBytes(input: InputStream, output: OutputStream, count: Int) {
+    private fun pipeBytes(input: InputStream, output: OutputStream, count: Long) {
         var remaining = count
         val buffer = ByteArray(BUFFER_SIZE)
         while (remaining > 0) {
-            val toRead = minOf(remaining, buffer.size)
+            val toRead = minOf(remaining, buffer.size.toLong()).toInt()
             val n = input.read(buffer, 0, toRead)
             if (n == -1) break
             output.write(buffer, 0, n)
@@ -316,6 +411,53 @@ class HttpProxyServer(
             _bytesSent.addAndGet(n.toLong())
         }
         output.flush()
+    }
+
+    /**
+     * Pipe HTTP chunked transfer encoding: reads chunk-size CRLF chunk-data CRLF ...
+     * until 0-length chunk. Forwards raw chunked encoding to output.
+     */
+    private fun pipeChunked(input: InputStream, output: OutputStream, label: String) {
+        try {
+            val isSending = label.contains("client->relay")
+            while (true) {
+                // Read chunk size line
+                val sizeLine = readLine(input) ?: break
+                val chunkSize = sizeLine.trim().split(";")[0].toLongOrNull(16) ?: break
+
+                // Forward chunk header
+                val header = "$sizeLine\r\n".toByteArray(Charsets.ISO_8859_1)
+                output.write(header)
+
+                if (chunkSize == 0L) {
+                    // Terminal chunk — read and forward trailing CRLF
+                    val trailer = readLine(input) ?: ""
+                    output.write("$trailer\r\n".toByteArray(Charsets.ISO_8859_1))
+                    output.flush()
+                    break
+                }
+
+                // Forward chunk data
+                var remaining = chunkSize
+                val buffer = ByteArray(BUFFER_SIZE)
+                while (remaining > 0) {
+                    val toRead = minOf(remaining.toInt(), buffer.size)
+                    val n = input.read(buffer, 0, toRead)
+                    if (n == -1) break
+                    output.write(buffer, 0, n)
+                    remaining -= n
+                    if (isSending) _bytesSent.addAndGet(n.toLong())
+                    else _bytesReceived.addAndGet(n.toLong())
+                }
+
+                // Read trailing CRLF after chunk data
+                val crlf = readLine(input) ?: break
+                output.write("$crlf\r\n".toByteArray(Charsets.ISO_8859_1))
+                output.flush()
+            }
+        } catch (_: Exception) {
+            // Connection closed
+        }
     }
 
     private fun sendError(output: OutputStream, status: String, message: String) {

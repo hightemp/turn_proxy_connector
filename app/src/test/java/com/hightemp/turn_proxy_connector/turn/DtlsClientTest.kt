@@ -1,70 +1,61 @@
 package com.hightemp.turn_proxy_connector.turn
 
+import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto
 import org.junit.Assert.*
 import org.junit.Test
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import java.io.IOException
+import java.security.SecureRandom
 
 /**
- * TDD tests for DtlsClient wrapper.
- * Tests use a simple UDP echo server to verify the DTLS layer works.
+ * Tests for DtlsClient and related classes.
+ * Real DTLS handshake can't be tested without a server, so we test
+ * the components: TurnDatagramTransport, InsecureDtlsTlsClient, etc.
  */
 class DtlsClientTest {
 
     @Test
-    fun `DtlsClient wraps DatagramSocket for net_Conn-like interface`() {
+    fun `DtlsClient initial state`() {
         val client = DtlsClient()
         assertNotNull(client)
+        assertFalse(client.isConnected)
+        client.close()
         assertFalse(client.isConnected)
     }
 
     @Test
-    fun `DtlsClient connect to DTLS server and handshake`() {
-        // We can't easily test real DTLS without a server,
-        // but we CAN test that the client creates a proper config
-        val config = DtlsClient.createDtlsConfig(insecureSkipVerify = true)
-        assertNotNull(config)
+    fun `InsecureDtlsTlsClient creates with correct crypto`() {
+        val crypto = BcTlsCrypto(SecureRandom())
+        val tlsClient = InsecureDtlsTlsClient(crypto)
+        // Client should be non-null and usable
+        assertNotNull(tlsClient)
     }
 
     @Test
-    fun `DtlsPacketTransport wraps UDP socket as PacketConn`() {
-        val socket = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
-        val transport = DtlsPacketTransport(socket)
-        assertNotNull(transport)
-        assertEquals(socket.localPort, transport.localPort)
-        socket.close()
+    fun `InsecureDtlsTlsClient authentication skips verification`() {
+        val crypto = BcTlsCrypto(SecureRandom())
+        val tlsClient = InsecureDtlsTlsClient(crypto)
+        // Authentication should be available (ServerOnlyTlsAuthentication)
+        assertNotNull(tlsClient.authentication)
     }
 
     @Test
-    fun `DtlsPacketTransport send and receive raw UDP`() {
-        // Echo server
-        val echoSocket = DatagramSocket(0, InetAddress.getByName("127.0.0.1"))
-        val echoPort = echoSocket.localPort
-
-        val latch = CountDownLatch(1)
-        Thread {
-            val buf = ByteArray(1024)
-            val pkt = DatagramPacket(buf, buf.size)
-            echoSocket.receive(pkt)
-            echoSocket.send(DatagramPacket(pkt.data, pkt.length, pkt.address, pkt.port))
-            latch.countDown()
-        }.start()
-
-        val clientSocket = DatagramSocket()
-        val transport = DtlsPacketTransport(clientSocket)
-
-        val testData = "hello dtls transport".toByteArray()
-        transport.send(testData, InetSocketAddress("127.0.0.1", echoPort))
-
-        val received = transport.receive(1000)
-        assertNotNull(received)
-        assertEquals("hello dtls transport", String(received!!.data, 0, received.length))
-
-        echoSocket.close()
-        clientSocket.close()
+    fun `TurnDatagramTransport limits and close`() {
+        // Create a minimal stub TurnClient for testing transport interface
+        val client = TurnClient(
+            serverAddress = java.net.InetSocketAddress("127.0.0.1", 1),
+            username = "test",
+            password = "test",
+            useUdp = true
+        )
+        val transport = TurnDatagramTransport(client, 0x4000, 1200)
+        assertEquals(1200, transport.receiveLimit)
+        // sendLimit = mtu - DTLS_OVERHEAD (80) = 1120
+        assertEquals(1120, transport.sendLimit)
+        transport.close()
+        // After close, receive throws IOException per BC DatagramTransport contract
+        val buf = ByteArray(100)
+        assertThrows(IOException::class.java) {
+            transport.receive(buf, 0, 100, 100)
+        }
     }
 }

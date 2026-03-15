@@ -1,159 +1,166 @@
 package com.hightemp.turn_proxy_connector.turn
 
+import org.bouncycastle.tls.CipherSuite
+import org.bouncycastle.tls.DTLSClientProtocol
+import org.bouncycastle.tls.DTLSTransport
+import org.bouncycastle.tls.DatagramTransport
+import org.bouncycastle.tls.DefaultTlsClient
+import org.bouncycastle.tls.ServerOnlyTlsAuthentication
+import org.bouncycastle.tls.TlsAuthentication
+import org.bouncycastle.tls.TlsFatalAlert
+import org.bouncycastle.tls.TlsServerCertificate
+import org.bouncycastle.tls.crypto.TlsCrypto
+import org.bouncycastle.tls.crypto.impl.bc.BcTlsCrypto
 import java.io.Closeable
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetSocketAddress
 import java.security.SecureRandom
 
 /**
- * UDP packet transport wrapper around DatagramSocket.
- * Provides send/receive methods for raw UDP packets.
+ * Bouncy Castle DTLS TLS client that:
+ * - Skips certificate verification (self-signed VPS cert)
+ * - Uses TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (matching Go server)
+ * - DTLS 1.2
  */
-class DtlsPacketTransport(
-    private val socket: DatagramSocket
-) {
-    val localPort: Int get() = socket.localPort
+class InsecureDtlsTlsClient(crypto: TlsCrypto) : DefaultTlsClient(crypto) {
 
-    fun send(data: ByteArray, target: InetSocketAddress) {
-        socket.send(DatagramPacket(data, data.size, target.address, target.port))
-    }
-
-    fun receive(timeoutMs: Int = 5000): DatagramPacket? {
-        return try {
-            val oldTimeout = socket.soTimeout
-            socket.soTimeout = timeoutMs
-            val buf = ByteArray(4096)
-            val pkt = DatagramPacket(buf, buf.size)
-            socket.receive(pkt)
-            socket.soTimeout = oldTimeout
-            pkt
-        } catch (_: Exception) {
-            null
+    override fun getAuthentication(): TlsAuthentication {
+        return object : ServerOnlyTlsAuthentication() {
+            override fun notifyServerCertificate(serverCertificate: TlsServerCertificate) {
+                // Accept any certificate (self-signed on VPS)
+            }
         }
     }
 
-    fun close() {
-        socket.close()
+    override fun getSupportedCipherSuites(): IntArray {
+        return intArrayOf(CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
     }
 }
 
 /**
- * DTLS client using Bouncy Castle.
+ * DTLS client using Bouncy Castle DTLSClientProtocol.
  *
- * Wraps a UDP DatagramSocket and establishes DTLS 1.2 connection,
- * providing a net.Conn-like InputStream/OutputStream interface
- * over the encrypted channel.
+ * Performs a real DTLS 1.2 handshake over the provided DatagramTransport
+ * (typically a TurnDatagramTransport wrapping TURN ChannelData).
  *
- * For the TURN proxy use case, DTLS wraps the UDP channel between
- * the TURN relay and the VPS server for obfuscation.
+ * After handshake, provides DTLSTransport for encrypted send/receive.
+ *
+ * Architecture:
+ *   HTTP data → DtlsClient.send() → DTLS encrypt → DatagramTransport → TURN → VPS
+ *   HTTP data ← DtlsClient.receive() ← DTLS decrypt ← DatagramTransport ← TURN ← VPS
  */
 class DtlsClient : Closeable {
 
-    private var socket: DatagramSocket? = null
+    private var dtlsTransport: DTLSTransport? = null
     private var connected = false
 
     val isConnected: Boolean get() = connected
 
     /**
-     * Connect to a DTLS server over UDP.
-     * Performs handshake with the remote peer.
+     * Perform DTLS handshake over the given datagram transport.
      *
-     * @param serverAddress The DTLS server address
-     * @param insecureSkipVerify If true, skip certificate verification (self-signed)
-     * @return Pair of InputStream/OutputStream for the encrypted channel
+     * @param transport The underlying transport (e.g., TurnDatagramTransport)
+     * @return DTLSTransport for encrypted communication, or null on failure
      */
-    fun connect(
-        serverAddress: InetSocketAddress,
-        insecureSkipVerify: Boolean = true
-    ): DtlsPacketTransport? {
-        try {
-            socket = DatagramSocket()
-            socket!!.connect(serverAddress)
+    fun connect(transport: DatagramTransport): DTLSTransport? {
+        return try {
+            val crypto = BcTlsCrypto(SecureRandom())
+            val tlsClient = InsecureDtlsTlsClient(crypto)
+            val protocol = DTLSClientProtocol()
 
-            // The DtlsPacketTransport provides raw UDP send/receive.
-            // In the full DTLS flow, BC DTLSClientProtocol would wrap this
-            // to provide encrypted InputStream/OutputStream.
-            // For now, we provide the transport layer that TurnClient uses.
+            val dtls = protocol.connect(tlsClient, transport)
+            dtlsTransport = dtls
             connected = true
-
-            return DtlsPacketTransport(socket!!)
-        } catch (e: Exception) {
+            dtls
+        } catch (e: TlsFatalAlert) {
+            android.util.Log.e("DtlsClient", "DTLS handshake TLS fatal alert: ${e.alertDescription}", e)
             connected = false
-            return null
+            null
+        } catch (e: Exception) {
+            android.util.Log.e("DtlsClient", "DTLS handshake failed: ${e.message}", e)
+            connected = false
+            null
         }
     }
 
     override fun close() {
         connected = false
-        try { socket?.close() } catch (_: Exception) {}
-    }
-
-    companion object {
-        /**
-         * Create a DTLS configuration.
-         * Returns a config map that can be used to establish DTLS connections.
-         */
-        fun createDtlsConfig(insecureSkipVerify: Boolean = true): Map<String, Any> {
-            return mapOf(
-                "insecureSkipVerify" to insecureSkipVerify,
-                "cipherSuites" to listOf("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"),
-                "minVersion" to "DTLS1.2",
-                "maxVersion" to "DTLS1.2"
-            )
-        }
+        try { dtlsTransport?.close() } catch (_: Exception) {}
+        dtlsTransport = null
     }
 }
 
 /**
- * Wraps DtlsClient + TurnClient into a single connection that:
- * 1. Connects to TURN server
- * 2. Allocates relay
- * 3. Creates permission for VPS peer
- * 4. Wraps traffic in DTLS over the TURN ChannelData
+ * InputStream wrapping a DTLSTransport.
+ * Each DTLS record becomes a chunk of data in the stream.
  *
- * This mirrors the reference client's architecture:
- *   App -> TURN relay -> DTLS -> VPS server -> Internet
+ * @param idleTimeoutMs Maximum time to wait for data before returning EOF.
+ *        Defaults to 30 minutes to match Go server's idle timeout.
+ *        For CONNECT tunnels this must be long enough for idle browsing.
  */
-class DtlsTurnConnection(
-    private val turnServerAddress: InetSocketAddress,
-    private val turnUsername: String,
-    private val turnPassword: String,
-    private val vpsAddress: InetSocketAddress,
-    private val useDtls: Boolean = true,
-    private val useUdp: Boolean = true
-) : Closeable {
+class DtlsInputStream(
+    private val transport: DTLSTransport,
+    private val idleTimeoutMs: Int = 30 * 60 * 1000
+) : InputStream() {
+    private var buffer: ByteArray? = null
+    private var offset = 0
 
-    private var turnClient: TurnClient? = null
-    private var channel: Int = -1
-
-    val isConnected: Boolean get() = turnClient?.isConnected == true && turnClient?.isAllocated == true
-
-    /**
-     * Establish the full tunnel: TURN allocate + permission + channel bind.
-     */
-    fun connect(): RelayStream? {
-        val client = TurnClient(
-            serverAddress = turnServerAddress,
-            username = turnUsername,
-            password = turnPassword,
-            useUdp = useUdp
-        )
-        turnClient = client
-
-        client.connect()
-        val relay = client.allocate() ?: return null
-        if (!client.createPermission(vpsAddress)) return null
-        channel = client.channelBind(vpsAddress)
-        if (channel < 0) return null
-
-        return client.getRelayStream(channel)
+    override fun read(): Int {
+        val b = ByteArray(1)
+        val n = read(b, 0, 1)
+        return if (n < 0) -1 else b[0].toInt() and 0xFF
     }
 
-    override fun close() {
-        turnClient?.close()
-        turnClient = null
+    override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (buffer == null || offset >= buffer!!.size) {
+            val tmp = ByteArray(2048)
+            val n = try {
+                transport.receive(tmp, 0, tmp.size, idleTimeoutMs)
+            } catch (_: Exception) {
+                -1
+            }
+            if (n <= 0) return -1  // n==0 would violate InputStream contract; treat as EOF
+            buffer = tmp.copyOf(n)
+            offset = 0
+        }
+        val available = buffer!!.size - offset
+        val toCopy = minOf(len, available)
+        System.arraycopy(buffer!!, offset, b, off, toCopy)
+        offset += toCopy
+        return toCopy
     }
 }
+
+/**
+ * OutputStream wrapping a DTLSTransport.
+ * Fragments large writes into DTLS-safe chunks.
+ */
+class DtlsOutputStream(private val transport: DTLSTransport) : OutputStream() {
+    /**
+     * Max plaintext chunk size per DTLS record.
+     * BC DTLSTransport.send() encrypts and adds overhead internally.
+     * Use getSendLimit() if available; otherwise conservative default.
+     * With MTU 1200 and ~80 bytes DTLS overhead → ~1120 bytes usable.
+     */
+    private val maxChunk: Int = try {
+        transport.sendLimit.coerceIn(256, 1400)
+    } catch (_: Exception) {
+        1100
+    }
+
+    override fun write(b: Int) {
+        write(byteArrayOf(b.toByte()), 0, 1)
+    }
+
+    override fun write(b: ByteArray, off: Int, len: Int) {
+        var pos = off
+        while (pos < off + len) {
+            val chunkSize = minOf(maxChunk, off + len - pos)
+            transport.send(b, pos, chunkSize)
+            pos += chunkSize
+        }
+    }
+
+    override fun flush() { /* DTLS sends immediately */ }
+}
+

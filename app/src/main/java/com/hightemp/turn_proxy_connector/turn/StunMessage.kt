@@ -132,12 +132,6 @@ class StunMessage(
         hmac.init(SecretKeySpec(key, "HmacSHA1"))
         val integrity = hmac.doFinal(toSign)
 
-        // Build final message
-        val attrBuf = ByteBuffer.allocate(24)
-        attrBuf.putShort(ATTR_MESSAGE_INTEGRITY.toShort())
-        attrBuf.putShort(20.toShort())
-        attrBuf.put(integrity)
-
         addAttribute(ATTR_MESSAGE_INTEGRITY, integrity)
 
         val finalBody = encodeAttributes()
@@ -202,10 +196,13 @@ class StunMessage(
         const val ALLOCATE_ERROR = 0x0113
         const val REFRESH_REQUEST = 0x0004
         const val REFRESH_SUCCESS = 0x0104
+        const val REFRESH_ERROR = 0x0114
         const val CREATE_PERMISSION_REQUEST = 0x0008
         const val CREATE_PERMISSION_SUCCESS = 0x0108
+        const val CREATE_PERMISSION_ERROR = 0x0118
         const val CHANNEL_BIND_REQUEST = 0x0009
         const val CHANNEL_BIND_SUCCESS = 0x0109
+        const val CHANNEL_BIND_ERROR = 0x0119
         const val SEND_INDICATION = 0x0016
         const val DATA_INDICATION = 0x0017
 

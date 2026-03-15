@@ -104,7 +104,7 @@ class TunnelConnectionTest {
     }
 
     @Test
-    fun `factory creates TurnTunnel when TURN servers provided`() {
+    fun `factory creates DtlsTurnTunnel when TURN servers provided and useDtls true`() {
         val servers = listOf(
             TurnServerConfig("turn.example.com", 3478, "user", "pass", false)
         )
@@ -112,6 +112,21 @@ class TunnelConnectionTest {
             turnServers = servers,
             vpsAddress = InetSocketAddress("10.0.0.1", 56000),
             useDtls = true,
+            connectionTimeout = 5000
+        )
+        val tunnel = factory.create()
+        assertTrue(tunnel is DtlsTurnTunnel)
+    }
+
+    @Test
+    fun `factory creates TurnTunnel when TURN servers provided and useDtls false`() {
+        val servers = listOf(
+            TurnServerConfig("turn.example.com", 3478, "user", "pass", false)
+        )
+        val factory = TunnelConnectionFactory(
+            turnServers = servers,
+            vpsAddress = InetSocketAddress("10.0.0.1", 56000),
+            useDtls = false,
             connectionTimeout = 5000
         )
         val tunnel = factory.create()

@@ -243,6 +243,19 @@ func handleConnectMethod(ctx context.Context, clientConn net.Conn, req *http.Req
 	wg.Wait()
 }
 
+// Global HTTP transport reused across all plain HTTP requests
+// to enable TCP connection pooling to upstream servers.
+var defaultTransport = &http.Transport{
+	DialContext: (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	MaxIdleConns:          100,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
 func handleHTTPRequest(clientConn net.Conn, req *http.Request) {
 	if !req.URL.IsAbs() {
 		req.URL.Scheme = "http"
@@ -251,20 +264,8 @@ func handleHTTPRequest(clientConn net.Conn, req *http.Request) {
 
 	removeHopByHopHeaders(req.Header)
 
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	defer transport.CloseIdleConnections()
-
 	req.RequestURI = ""
-	resp, err := transport.RoundTrip(req)
+	resp, err := defaultTransport.RoundTrip(req)
 	if err != nil {
 		log.Printf("Proxy request error: %v", err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
