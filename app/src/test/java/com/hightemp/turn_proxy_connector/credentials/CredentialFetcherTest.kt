@@ -1,8 +1,12 @@
 package com.hightemp.turn_proxy_connector.credentials
 
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import org.junit.Assert.*
 import org.junit.Test
 import java.net.InetSocketAddress
+import java.util.concurrent.TimeUnit
 
 /**
  * TDD tests for TURN credential fetchers.
@@ -251,5 +255,127 @@ class CredentialFetcherTest {
     fun `CredentialFetcherFactory returns null for unknown link`() {
         val fetcher = CredentialFetcherFactory.create("https://example.com/something")
         assertNull(fetcher)
+    }
+
+    // ---- Yandex WebSocket integration ----
+
+    @Test
+    fun `YandexCredentialFetcher fetchCredsViaWebSocket sends hello and receives TURN creds`() {
+        val server = MockWebServer()
+        val serverHelloJson = """
+        {
+            "uid": "abc",
+            "serverHello": {
+                "rtcConfiguration": {
+                    "iceServers": [
+                        {"urls": ["stun:stun.example.com:3478"]},
+                        {
+                            "urls": ["turn:relay.yandex.ru:3478?transport=udp"],
+                            "username": "wsuser",
+                            "credential": "wspass"
+                        }
+                    ]
+                }
+            }
+        }
+        """.trimIndent()
+
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+            override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                // Verify it's a hello message
+                assertTrue(text.contains("\"hello\""))
+                assertTrue(text.contains("\"roomId\""))
+                // Send ack first (should be skipped by client)
+                webSocket.send("""{"uid":"x","ack":{"status":{"code":"OK"}}}""")
+                // Then send serverHello with TURN creds
+                webSocket.send(serverHelloJson)
+            }
+        }))
+
+        server.start()
+        try {
+            val wsUrl = "ws://${server.hostName}:${server.port}"
+            val confData = YandexCredentialFetcher.ConferenceData(
+                roomId = "room1",
+                peerId = "peer1",
+                wssUrl = wsUrl,
+                credentials = "testcred"
+            )
+
+            val fetcher = YandexCredentialFetcher("https://telemost.yandex.ru/j/test123")
+            val creds = fetcher.fetchCredsViaWebSocket(confData)
+
+            assertNotNull(creds)
+            assertEquals("wsuser", creds!!.username)
+            assertEquals("wspass", creds.password)
+            assertEquals("relay.yandex.ru:3478", creds.serverAddress)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `YandexCredentialFetcher fetchCredsViaWebSocket returns null on WebSocket failure`() {
+        val server = MockWebServer()
+        // Non-WebSocket response triggers onFailure in the client
+        server.enqueue(MockResponse().setResponseCode(404))
+        server.start()
+
+        try {
+            val wsUrl = "ws://${server.hostName}:${server.port}"
+            val confData = YandexCredentialFetcher.ConferenceData(
+                roomId = "room1",
+                peerId = "peer1",
+                wssUrl = wsUrl,
+                credentials = "testcred"
+            )
+
+            val fetcher = YandexCredentialFetcher("https://telemost.yandex.ru/j/test123")
+            val creds = fetcher.fetchCredsViaWebSocket(confData)
+            assertNull(creds)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `YandexCredentialFetcher fetchCredsViaWebSocket returns null when no TURN in serverHello`() {
+        val server = MockWebServer()
+        val serverHelloNoTurn = """
+        {
+            "uid": "abc",
+            "serverHello": {
+                "rtcConfiguration": {
+                    "iceServers": [
+                        {"urls": ["stun:stun.example.com:3478"]}
+                    ]
+                }
+            }
+        }
+        """.trimIndent()
+
+        server.enqueue(MockResponse().withWebSocketUpgrade(object : okhttp3.WebSocketListener() {
+            override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
+                webSocket.send(serverHelloNoTurn)
+                webSocket.close(1000, "done")
+            }
+        }))
+
+        server.start()
+        try {
+            val wsUrl = "ws://${server.hostName}:${server.port}"
+            val confData = YandexCredentialFetcher.ConferenceData(
+                roomId = "room1",
+                peerId = "peer1",
+                wssUrl = wsUrl,
+                credentials = "testcred"
+            )
+
+            val fetcher = YandexCredentialFetcher("https://telemost.yandex.ru/j/test123")
+            val creds = fetcher.fetchCredsViaWebSocket(confData)
+            assertNull(creds)
+        } finally {
+            server.shutdown()
+        }
     }
 }

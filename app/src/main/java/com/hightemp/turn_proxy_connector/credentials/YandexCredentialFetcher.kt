@@ -3,11 +3,18 @@ package com.hightemp.turn_proxy_connector.credentials
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonParser
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * Fetches TURN credentials from Yandex Telemost.
@@ -17,15 +24,11 @@ import java.util.UUID
  *
  * Flow:
  * 1. GET conference info from cloud-api.yandex.ru
- * 2. Connect to media server via WebSocket
+ * 2. Connect to media server via WebSocket (OkHttp)
  * 3. Send "hello" message
  * 4. Receive serverHello with ICE servers (TURN credentials)
- *
- * Note: The WebSocket step requires OkHttp or similar library.
- * For now, the parsing logic is fully implemented and tested.
- * The actual WebSocket call will be added when OkHttp is available.
  */
-class YandexCredentialFetcher(private val link: String) : CredentialFetcher {
+open class YandexCredentialFetcher(private val link: String) : CredentialFetcher {
 
     /**
      * Conference data extracted from the Yandex API response.
@@ -40,6 +43,7 @@ class YandexCredentialFetcher(private val link: String) : CredentialFetcher {
     companion object {
         private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
         private const val TELEMOST_CONF_HOST = "cloud-api.yandex.ru"
+        private const val WS_TIMEOUT_SECONDS = 15L
 
         /**
          * Extract the link ID from a Telemost URL.
@@ -197,11 +201,84 @@ class YandexCredentialFetcher(private val link: String) : CredentialFetcher {
         val confJson = doGet(confUrl)
         val confData = parseConferenceResponse(confJson) ?: return null
 
-        // Step 2: WebSocket connection to media server
-        // This requires a WebSocket library (OkHttp).
-        // For now, return null — the parsing logic is tested and ready.
-        // TODO: Add OkHttp WebSocket integration
-        return null
+        // Step 2-4: WebSocket connection to media server
+        return fetchCredsViaWebSocket(confData)
+    }
+
+    /**
+     * Connect to the Yandex media server via WebSocket, send hello,
+     * and receive serverHello containing TURN credentials.
+     *
+     * Protocol (from Go reference):
+     *   1. Dial wss://... with Origin + User-Agent headers
+     *   2. Send JSON hello message
+     *   3. Read messages in loop:
+     *      - "ack" messages → skip
+     *      - "serverHello" with rtcConfiguration.iceServers → extract TURN creds
+     *   4. Return TurnCredentials or null on timeout (15s)
+     */
+    internal fun fetchCredsViaWebSocket(confData: ConferenceData): TurnCredentials? {
+        val client = createWebSocketClient()
+
+        val request = Request.Builder()
+            .url(confData.wssUrl)
+            .header("Origin", "https://telemost.yandex.ru")
+            .header("User-Agent", USER_AGENT)
+            .build()
+
+        val result = CompletableFuture<TurnCredentials?>()
+
+        val ws = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                val hello = buildHelloMessage(confData)
+                webSocket.send(hello)
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                // Skip ack messages
+                try {
+                    val obj = JsonParser.parseString(text).asJsonObject
+                    if (obj.has("ack")) return
+                } catch (_: Exception) {}
+
+                // Try to parse TURN credentials from serverHello
+                val creds = parseTurnFromServerHello(text)
+                if (creds != null) {
+                    result.complete(creds)
+                    webSocket.close(1000, "done")
+                }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                result.complete(null)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                // If we haven't received creds yet, complete with null
+                result.complete(null)
+            }
+        })
+
+        return try {
+            result.get(WS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { ws.close(1000, "done") } catch (_: Exception) {}
+            client.dispatcher.executorService.shutdown()
+        }
+    }
+
+    /**
+     * Create an OkHttpClient for the WebSocket connection.
+     * Extracted to allow overriding in tests.
+     */
+    internal open fun createWebSocketClient(): OkHttpClient {
+        return OkHttpClient.Builder()
+            .connectTimeout(WS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .readTimeout(WS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .writeTimeout(WS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .build()
     }
 
     private fun doGet(urlStr: String): String {
